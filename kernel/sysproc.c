@@ -110,3 +110,44 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// set up & configure a periodic alarm for a process
+// @args [interval, handler]
+uint64
+sys_sigalarm(void)
+{
+  int interval;
+  uint64 handler;
+  struct proc *p = myproc();
+
+  argint(0, &interval);
+  argaddr(1, &handler);
+
+  if (interval < 0)
+    return -1;
+
+  p->alarm_interval = interval;
+  p->alarm_handler = handler;
+  p->alarm_elapsed = 0;
+
+  return 0;
+}
+
+// restore the interrupted user context, reset alarm & return to original execution point
+// @returns the value of a0 register before the alarm handler was invoked
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+  uint64 saved_a0;
+
+  if (!p->alarm_active)
+    return -1;
+  saved_a0 = p->alarm_trapframe.a0;
+
+  memmove(p->trapframe, &p->alarm_trapframe, sizeof(struct trapframe));
+  p->alarm_active = 0;
+  p->alarm_elapsed = 0;
+
+  return saved_a0;
+}

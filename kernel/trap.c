@@ -81,6 +81,21 @@ usertrap(void)
   if (killed(p))
     kexit(-1);
 
+  // handle periodic user-level alarms
+  // save the interrupted user context
+  // prevent nested alarms and reset the timer
+  // schedule the handler for execution upon returning to user mode
+  if (which_dev == 2 && p->alarm_interval > 0 && !p->alarm_active) {
+    p->alarm_elapsed++;
+
+    if (p->alarm_elapsed >= p->alarm_interval) {
+      memmove(&p->alarm_trapframe, p->trapframe, sizeof(struct trapframe));
+      p->alarm_active = 1;
+      p->alarm_elapsed = 0;
+      p->trapframe->epc = p->alarm_handler;
+    }
+  }
+
   // give up the CPU if this is a timer interrupt.
   if (which_dev == 2)
     yield();
