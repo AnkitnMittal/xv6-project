@@ -590,7 +590,11 @@ writebig(char *s)
     exit(1);
   }
 
+  printf("%s: writing %ld blocks...\n", s, MAXFILE);
   for (i = 0; i < MAXFILE; i++) {
+    if (i > 0 && i % 1000 == 0)
+      printf("%s: writing block %d/%ld\n", s, i, MAXFILE);
+
     ((int *)buf)[0] = i;
     if (write(fd, buf, BSIZE) != BSIZE) {
       printf("%s: error: write big file failed i=%d\n", s, i);
@@ -606,8 +610,12 @@ writebig(char *s)
     exit(1);
   }
 
+  printf("%s: reading & verifying %ld blocks...\n", s, MAXFILE);
   n = 0;
   for (;;) {
+    if (n > 0 && n % 1000 == 0)
+      printf("%s: reading block %d/%ld\n", s, n, MAXFILE);
+
     i = read(fd, buf, BSIZE);
     if (i == 0) {
       if (n != MAXFILE) {
@@ -630,6 +638,7 @@ writebig(char *s)
     printf("%s: unlink big failed\n", s);
     exit(1);
   }
+  printf("%s: finished successfully!\n", s);
 }
 
 // many creates, followed by unlink test
