@@ -129,7 +129,9 @@ kexec(char *path, char **argv)
       last = s + 1;
   safestrcpy(p->name, last, sizeof(p->name));
 
-  // Commit to the user image.
+  // Commit to the user image
+  // Remove old mmap regions before freeing old page table
+  mmap_cleanup(p);
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
   p->sz = sz;

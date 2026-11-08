@@ -7,6 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -136,6 +139,18 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
   pa = PTE2PA(*pte);
   return pa;
+}
+
+// Check whether a virtual address is already mapped
+int
+ismapped(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  va = PGROUNDDOWN(va);
+  if (va >= MAXVA) return 0;
+  pte = walk(pagetable, va, 0);
+  if (pte == 0) return 0;
+  return (*pte & PTE_V) != 0;
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -325,6 +340,101 @@ err:
   return -1;
 }
 
+// Copy mmap pages when a process forks.
+// MAP_SHARED:
+//   Parent and child use the same physical pages.
+// MAP_PRIVATE:
+//   Child receives independent copies of allocated pages
+int
+mmap_forkcopy(struct proc *parent, struct proc *child)
+{
+  for (int i = 0; i < NVMA; i++) {
+    struct vm_area_struct *vm = &parent->vma[i];
+
+    if (!vm->valid) continue;
+    for (uint64 va = vm->start_ad; va < vm->end_ad; va += PGSIZE) {
+      pte_t *pte = walk(parent->pagetable, va, 0);
+      // Check whether parent has already loaded this page.
+      int present = (pte != 0 && (*pte & PTE_V));
+
+      //CASE1 MAP_SHARED
+      if (vm->flags == MAP_SHARED) {
+        // Make sure every shared page has a physical page
+        // before the child starts running.
+        if (!present) {
+          char *mem = kalloc();
+          if (mem == 0) return -1;
+          memset(mem, 0, PGSIZE);
+          uint64 relative_off = va - vm->start_ad;
+          uint64 file_off = vm->offset + relative_off;
+          // Load the corresponding file data.
+          if (relative_off < vm->len) {
+            uint64 remaining = vm->len - relative_off;
+            uint read_len = remaining > PGSIZE
+                              ? PGSIZE
+                              : (uint)remaining;
+
+            struct inode *ip = vm->file->ip;
+            ilock(ip);
+            if (file_off < ip->size) {
+              uint available = ip->size - (uint)file_off;
+              if (read_len > available) read_len = available;
+              if (read_len > 0) readi(ip, 0, (uint64)mem, (uint)file_off, read_len);
+            }
+            iunlock(ip);
+          }
+
+          // Determine permissions.
+          int perm = PTE_U;
+          if (vm->prot & PROT_READ) perm |= PTE_R;
+          if (vm->prot & PROT_WRITE) perm |= PTE_R | PTE_W;
+
+          // Install this page in the parent's page table.
+          if (mappages(parent->pagetable, va, PGSIZE, (uint64)mem, perm) != 0) {
+            kfree(mem);
+            return -1;
+          }
+          pte = walk(parent->pagetable, va, 0);
+          if (pte == 0 || !(*pte & PTE_V)) return -1;
+        }
+
+        // Get the parent's physical page.
+        uint64 pa = PTE2PA(*pte);
+        uint flags = PTE_FLAGS(*pte);
+
+        // Keep physical page alive for the child.
+        kref((void *)pa);
+
+        // Map the same physical page into the child.
+        if (mappages(child->pagetable, va, PGSIZE, pa, flags) != 0) {
+          // Undo the reference increment.
+          kfree((void *)pa);
+          return -1;
+        }
+      }
+
+      //CASE2 MAP_PRIVATE
+      else if (vm->flags == MAP_PRIVATE) {
+        // An unloaded private page remains lazy.
+        if (!present) continue;
+        uint64 pa = PTE2PA(*pte);
+        uint flags = PTE_FLAGS(*pte);
+        // Allocate a separate physical page.
+        char *mem = kalloc();
+        if (mem == 0) return -1;
+        // Copy parent's page contents.
+        memmove(mem, (char *)pa, PGSIZE);
+        // Map the independent copy into child.
+        if (mappages(child->pagetable, va, PGSIZE, (uint64)mem, flags) != 0) {
+          kfree(mem);
+          return -1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -459,33 +569,76 @@ uint64
 vmfault(pagetable_t pagetable, uint64 psz, uint64 va, int read)
 {
   uint64 mem;
-
-  if (va >= psz)
-    return 0;
+  struct proc *p = myproc();
   va = PGROUNDDOWN(va);
   if (ismapped(pagetable, va)) {
     return 0;
   }
+
+  // CASE 1: Normal lazy allocation (sys_sbrk)
+  if (va < psz) {
+    mem = (uint64)kalloc();
+    if (mem == 0)
+      return 0;
+    memset((void *)mem, 0, PGSIZE);
+    if (mappages(pagetable, va, PGSIZE, mem,
+                 PTE_W | PTE_U | PTE_R) != 0) {
+      kfree((void *)mem);
+      return 0;
+    }
+    return mem;
+  }
+
+  // CASE 2: Memory mapped file (mmap)
+  struct vm_area_struct *vm = 0;
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].valid && p->vma[i].start_ad <= va && va < p->vma[i].end_ad) {
+      vm = &p->vma[i];
+      break;
+    }
+  }
+  if (vm == 0)
+    return 0;
+  if (read && !(vm->prot & PROT_READ))
+    return 0;
+  if (!read && !(vm->prot & PROT_WRITE))
+    return 0;
   mem = (uint64)kalloc();
   if (mem == 0)
     return 0;
   memset((void *)mem, 0, PGSIZE);
-  if (mappages(pagetable, va, PGSIZE, mem, PTE_W | PTE_U | PTE_R) != 0) {
+
+  // Calculate the offset relative to the current VMA.
+uint64 relative_off = va - vm->start_ad;
+
+// Calculate the actual file offset.
+  uint64 file_off = vm->offset + relative_off;
+  if (relative_off < vm->len) {
+    uint64 remaining = vm->len - relative_off;
+    uint read_len = remaining > PGSIZE
+                      ? PGSIZE
+                      : (uint)remaining;
+    struct inode *ip = vm->file->ip;
+    ilock(ip);
+    // Do not read beyond the actual file size.
+    if (file_off < ip->size) {
+      uint available = ip->size - (uint)file_off;
+      if (read_len > available)
+        read_len = available;
+      if (read_len > 0)
+        readi(ip, 0, mem, (uint)file_off, read_len);
+    }
+    iunlock(ip);
+  }
+  
+  int perm = PTE_U;
+  if (vm->prot & PROT_READ)
+    perm |= PTE_R;
+  if (vm->prot & PROT_WRITE)
+    perm |= PTE_R | PTE_W;
+  if (mappages(pagetable, va, PGSIZE, mem, perm) != 0) {
     kfree((void *)mem);
     return 0;
   }
   return mem;
-}
-
-int
-ismapped(pagetable_t pagetable, uint64 va)
-{
-  pte_t *pte = walk(pagetable, va, 0);
-  if (pte == 0) {
-    return 0;
-  }
-  if (*pte & PTE_V) {
-    return 1;
-  }
-  return 0;
 }

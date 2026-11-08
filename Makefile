@@ -152,6 +152,7 @@ UPROGS=\
 	$U/_dorphan\
 	$U/_sync\
 	$U/_alarmtest\
+	$U/_mmaptest
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

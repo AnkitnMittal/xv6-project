@@ -23,3 +23,5 @@
 #define SYS_sync   22
 #define SYS_sigalarm  23
 #define SYS_sigreturn 24
+#define SYS_mmap      25
+#define SYS_munmap    26

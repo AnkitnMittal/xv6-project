@@ -45,3 +45,5 @@ entry("uptime");
 entry("sync");
 entry("sigalarm");
 entry("sigreturn");
+entry("mmap");
+entry("munmap");

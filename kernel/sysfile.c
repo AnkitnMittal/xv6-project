@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -527,4 +528,256 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+// Memory map a file into the process's virtual address space.
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  uint64 length;
+  uint64 offset;
+
+  int prot;
+  int flags;
+  int fd;
+
+  struct file *f;
+  struct proc *p = myproc();
+  struct vm_area_struct *vm = 0;
+
+  // read system call arguments
+  argaddr(0, &addr);
+  argaddr(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argaddr(5, &offset);
+
+  // validate
+  if (addr != 0 || length == 0 || offset != 0)
+    return -1;
+  if (prot != PROT_READ &&
+      prot != PROT_WRITE &&
+      prot != (PROT_READ | PROT_WRITE))
+    return -1;
+  if (flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return -1;
+
+  // get the file descriptor and corresponding file
+  if (argfd(4, &fd, &f) < 0)
+    return -1;
+
+  // only regular files can be memory mapped
+  if (f->type != FD_INODE || !f->readable)
+    return -1;
+
+  ilock(f->ip);
+  int regular_file = (f->ip->type == T_FILE);
+  iunlock(f->ip);
+
+  if (!regular_file)
+    return -1;
+
+  // shared writable mapping requires a writable file
+  if (flags == MAP_SHARED &&
+      (prot & PROT_WRITE) &&
+      !f->writable)
+    return -1;
+
+  // calculate page-aligned mapping size
+  if (length > TRAPFRAME)
+    return -1;
+
+  uint64 map_len = PGROUNDUP(length);
+
+  if (map_len < length)
+    return -1;
+
+  // allocate virtual address space from top to bottom
+  uint64 cur_max = p->cur_max;
+
+  if (cur_max < map_len)
+    return -1;
+
+  uint64 start_addr = cur_max - map_len;
+
+  // do not overlap existing heap memory
+  if (start_addr < PGROUNDUP(p->sz))
+    return -1;
+
+  // find an available VMA entry
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].valid == 0) {
+      vm = &p->vma[i];
+      break;
+    }
+  }
+
+  if (vm == 0)
+    return -1;
+
+  // initialize the VMA
+  vm->valid = 1;
+  vm->start_ad = start_addr;
+  vm->end_ad = cur_max;
+  vm->len = length;
+  vm->offset = 0;
+  vm->prot = prot;
+  vm->flags = flags;
+  vm->fd = fd;
+  // keep the file alive even if the user closes its fd
+  vm->file = filedup(f);
+  // update the next available mmap address
+  p->cur_max = start_addr;
+  // return the starting virtual address
+  return start_addr;
+}
+
+// Unmap a previously mapped memory region.
+uint64
+sys_munmap(void) {
+  uint64 addr;
+  uint64 length;
+  struct proc *p = myproc();
+  struct vm_area_struct *vm = 0;
+  // 1. Read system call arguments.
+  argaddr(0, &addr);
+  argaddr(1, &length);
+  // 2. Validate arguments.
+  if (length == 0 || addr % PGSIZE != 0) return -1;
+  if (addr + length < addr || addr + length >= MAXVA) return -1;
+  uint64 start = addr;
+  uint64 end = PGROUNDUP(addr + length);
+  if (end <= start) return -1;
+
+  // 3. Find the VMA containing the requested range.
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].valid &&
+        start >= p->vma[i].start_ad &&
+        end <= p->vma[i].end_ad) {
+
+      vm = &p->vma[i];
+      break;
+    }
+  }
+  if (vm == 0) return -1;
+  // 4. Only allow unmapping from the beginning,
+  //    the end, or the entire VMA.
+  if (start != vm->start_ad && end != vm->end_ad) return -1;
+
+  // 5. Write modified pages back for MAP_SHARED.
+  if (vm->flags == MAP_SHARED) {
+    struct inode *ip = vm->file->ip;
+    for (uint64 va = start; va < end; va += PGSIZE) {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      // Skip pages that have never been allocated.
+      if (pte == 0 || (*pte & PTE_V) == 0) continue;
+      uint64 relative_off = va - vm->start_ad;
+      uint64 file_off = vm->offset + relative_off;
+      // Do not write beyond the mapping length.
+      if (relative_off >= vm->len) continue;
+      uint64 bytes = vm->len - relative_off;
+      if (bytes > PGSIZE) bytes = PGSIZE;
+      // Begin one filesystem transaction per page.
+      begin_op();
+      ilock(ip);
+      // Do not extend the file beyond its existing size.
+      if (file_off < ip->size) {
+        uint available = ip->size - (uint)file_off;
+        if (bytes > available) bytes = available;
+        if (bytes > 0) {
+          uint64 pa = PTE2PA(*pte);
+          writei(ip, 0, pa, (uint)file_off, (uint)bytes);
+        }
+      }
+      iunlock(ip);
+      end_op();
+    }
+  }
+
+  // 6. Remove the specified mappings.
+  uint64 npages = (end - start) / PGSIZE;
+  uvmunmap(p->pagetable, start, npages, 1);
+  // 7. Update VMA metadata.
+  // Case A: Entire VMA is removed.
+  if (start == vm->start_ad && end == vm->end_ad) {
+    struct file *f = vm->file;
+    if (p->cur_max == vm->start_ad) p->cur_max = vm->end_ad;
+    memset(vm, 0, sizeof(*vm));
+    fileclose(f);
+  }
+
+  // Case B: Beginning of VMA is removed.
+  else if (start == vm->start_ad) {
+    uint64 removed = end - start;
+    vm->offset += removed;
+    if (vm->len > removed) vm->len -= removed;
+    else vm->len = 0;
+    vm->start_ad = end;
+    // Reclaim address space if this was the
+    // lowest allocated VMA.
+    if (p->cur_max == start) p->cur_max = end;
+  }
+  // Case C: End of VMA is removed.
+  else if (end == vm->end_ad) {
+    uint64 remaining = start - vm->start_ad;
+    if (vm->len > remaining) vm->len = remaining;
+    vm->end_ad = start;
+  }
+  return 0;
+}
+
+// Clean up all memory mapped regions of a process.
+void
+mmap_cleanup(struct proc *p)
+{
+  for (int i = 0; i < NVMA; i++) {
+    struct vm_area_struct *vm = &p->vma[i];
+    if (!vm->valid) continue;
+    // Write modified pages back for MAP_SHARED.
+    if (vm->flags == MAP_SHARED) {
+      struct inode *ip = vm->file->ip;
+      for (uint64 va = vm->start_ad; va < vm->end_ad; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+
+        // Skip pages that have not been allocated.
+        if (pte == 0 || !(*pte & PTE_V)) continue;
+        uint64 relative_off = va - vm->start_ad;
+        if (relative_off >= vm->len) continue;
+        uint64 file_off = vm->offset + relative_off;
+        uint64 bytes = vm->len - relative_off;
+
+        if (bytes > PGSIZE) bytes = PGSIZE;
+        begin_op();
+        ilock(ip);
+
+        // Never extend the file during mmap cleanup.
+        if (file_off < ip->size) {
+          uint available = ip->size - (uint)file_off;
+          if (bytes > available) bytes = available;
+          if (bytes > 0) {
+            uint64 pa = PTE2PA(*pte);
+            writei(ip, 0, pa, (uint)file_off, (uint)bytes);
+          }
+        }
+        iunlock(ip);
+        end_op();
+      }
+    }
+
+    // Unmap all pages belonging to this VMA.
+    if (p->pagetable) {
+      uint64 npages = (vm->end_ad - vm->start_ad) / PGSIZE;
+      uvmunmap(p->pagetable,
+               vm->start_ad,
+               npages,
+               1);
+    }
+    // Release the mapped file reference.
+    struct file *f = vm->file;
+    memset(vm, 0, sizeof(*vm));
+    if (f) fileclose(f);
+  }
+  // Restore the initial mmap allocation boundary.
+  p->cur_max = TRAPFRAME;
 }

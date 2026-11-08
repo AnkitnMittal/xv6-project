@@ -125,6 +125,12 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  // Initialize memory mapped regions
+  memset(p->vma, 0, sizeof(p->vma));
+
+  // Start mmap allocation below trapframe
+  p->cur_max = TRAPFRAME;
+
   // Initialize periodic alarm state.
   p->alarm_interval = 0;
   p->alarm_handler = 0;
@@ -161,6 +167,8 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  // Ensure no mmap regions or file references are leaked.
+  mmap_cleanup(p);
   if (p->trapframe)
     kfree((void *)p->trapframe);
   p->trapframe = 0;
@@ -246,7 +254,7 @@ growproc(int n)
 
   sz = p->sz;
   if (n > 0) {
-    if (sz + n > TRAPFRAME) {
+    if (sz + n < sz || sz + n > p->cur_max) {
       return -1;
     }
     if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
@@ -280,6 +288,9 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  
+  // Copy mmap allocation boundary from parent.
+  np->cur_max = p->cur_max;
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -287,10 +298,27 @@ kfork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
-  // increment reference counts on open file descriptors.
-  for (i = 0; i < NOFILE; i++)
-    if (p->ofile[i])
-      np->ofile[i] = filedup(p->ofile[i]);
+  // Copy memory mapped regions from parent to child.
+  for (int j = 0; j < NVMA; j++) {
+    if (p->vma[j].valid) {
+      np->vma[j] = p->vma[j];
+      // Acquire a separate reference to the mapped file.
+      np->vma[j].file = filedup(p->vma[j].file);
+    }
+  }
+
+  // Copy the mapped physical pages.
+  if (mmap_forkcopy(p, np) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
+  // Increment reference counts on open file descriptors.
+  for (i = 0; i < NOFILE; i++) {
+    if (p->ofile[i]) np->ofile[i] = filedup(p->ofile[i]);
+  }
+
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
@@ -333,8 +361,9 @@ kexit(int status)
 {
   struct proc *p = myproc();
 
-  if (p == initproc)
-    panic("init exiting");
+  if (p == initproc) panic("init exiting");
+  // Clean up memory mapped regions before closing files.
+  mmap_cleanup(p);
 
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {

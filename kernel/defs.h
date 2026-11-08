@@ -60,6 +60,7 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void            kref(void *);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -86,6 +87,7 @@ int             growproc(int);
 void            proc_mapstacks(pagetable_t);
 pagetable_t     proc_pagetable(struct proc *);
 void            proc_freepagetable(pagetable_t, uint64);
+void            mmap_cleanup(struct proc *);
 int             kkill(int);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
@@ -170,6 +172,7 @@ int             copyin(pagetable_t, uint64, char *, uint64, uint64);
 int             copyinstr(pagetable_t, uint64, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, uint64, int);
+int             mmap_forkcopy(struct proc *, struct proc *);
 
 // plic.c
 void            plicinit(void);
