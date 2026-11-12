@@ -107,6 +107,7 @@ extern uint64 sys_sigalarm(void);
 extern uint64 sys_sigreturn(void);
 extern uint64 sys_mmap(void);
 extern uint64 sys_munmap(void);
+extern uint64 sys_symlink(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -138,6 +139,7 @@ static uint64 (*syscalls[])(void) = {
   [SYS_sigreturn] = sys_sigreturn,
   [SYS_mmap]      = sys_mmap,
   [SYS_munmap]    = sys_munmap,
+  [SYS_symlink]   = sys_symlink,
   // clang-format on
 };
 

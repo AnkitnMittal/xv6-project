@@ -152,7 +152,8 @@ UPROGS=\
 	$U/_dorphan\
 	$U/_sync\
 	$U/_alarmtest\
-	$U/_mmaptest
+	$U/_mmaptest\
+	$U/_symlinktest
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

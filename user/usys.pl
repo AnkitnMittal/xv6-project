@@ -47,3 +47,4 @@ entry("sigalarm");
 entry("sigreturn");
 entry("mmap");
 entry("munmap");
+entry("symlink");
