@@ -749,6 +749,69 @@ exectest(char *s)
   }
 }
 
+// A zero-length pipe read must not wait for data or consume any.
+static void
+pipezeroread(char *s)
+{
+  int fds[2];
+  char c = 'z';
+
+  if (pipe(fds) < 0) {
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+  // Keep the write end open so an empty pipe is not at EOF.
+  if (read(fds[0], &c, 0) != 0 || c != 'z') {
+    printf("%s: zero-length read on empty pipe failed\n", s);
+    exit(1);
+  }
+  if (write(fds[1], "x", 1) != 1 || read(fds[0], &c, 0) != 0 || c != 'z' ||
+      read(fds[0], &c, 1) != 1 || c != 'x') {
+    printf("%s: zero-length read consumed data\n", s);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+void
+pipezero(char *s)
+{
+  int reader, timer, pid, status;
+
+  if ((reader = fork()) < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (reader == 0) {
+    pipezeroread(s);
+    exit(0);
+  }
+  if ((timer = fork()) < 0) {
+    kill(reader);
+    wait(0);
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (timer == 0) {
+    pause(50);
+    exit(0);
+  }
+
+  // Reap both children, even if the reader blocks indefinitely.
+  pid = wait(&status);
+  if (pid == timer) {
+    kill(reader);
+    wait(0);
+    printf("%s: zero-length read timed out\n", s);
+    exit(1);
+  }
+  kill(timer);
+  wait(0);
+  if (pid != reader || status != 0)
+    exit(1);
+}
+
 // simple fork and pipe read/write
 
 void
@@ -2791,7 +2854,7 @@ lazy_sbrk(char *s)
   char *p = sbrk(0);
   while ((uint64)p < MAXVA - (1 << 30)) {
     p = sbrklazy(1 << 30);
-    if (p < 0) {
+    if (p == SBRK_ERROR) {
       printf("sbrklazy(%d) returned %p\n", 1 << 30, p);
       exit(1);
     }
@@ -2802,13 +2865,13 @@ lazy_sbrk(char *s)
   int n = TRAPFRAME - PGSIZE - (uint64)p;
 
   char *p1 = sbrklazy(n);
-  if (p1 < 0 || p1 != p) {
+  if (p1 == SBRK_ERROR || p1 != p) {
     printf("sbrklazy(%d) returned %p, not expected %p\n", n, p1, p);
     exit(1);
   }
 
   p = sbrk(PGSIZE);
-  if (p < 0 || (uint64)p != TRAPFRAME - PGSIZE) {
+  if (p == SBRK_ERROR || (uint64)p != TRAPFRAME - PGSIZE) {
     printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
     exit(1);
   }
@@ -2992,6 +3055,7 @@ struct test {
   {createtest, "createtest"},
   {dirtest, "dirtest"},
   {exectest, "exectest"},
+  {pipezero, "pipezero"},
   {pipe1, "pipe1"},
   {killstatus, "killstatus"},
   {killzero, "killzero"},
