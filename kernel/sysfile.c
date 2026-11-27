@@ -195,6 +195,7 @@ sys_symlink(void)
   if ((n = argstr(0, target, MAXPATH)) < 0 || argstr(1, path, MAXPATH) < 0)
     return -1;
 
+  n++;
   begin_op();
   if ((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
     end_op();
@@ -203,7 +204,6 @@ sys_symlink(void)
 
   if (writei(ip, 0, (uint64)target, 0, n) != n) {
     ip->nlink = 0;
-    iupdate(ip);
     iunlockput(ip);
     end_op();
     return -1;
@@ -312,7 +312,8 @@ create(char *path, short type, short major, short minor)
   if ((ip = dirlookup(dp, name, 0)) != 0) {
     iunlockput(dp);
     ilock(ip);
-    if (type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+    if (type == T_FILE &&
+        (ip->type == T_FILE || ip->type == T_DEVICE || ip->type == T_SYMLINK))
       return ip;
     iunlockput(ip);
     return 0;
@@ -361,13 +362,18 @@ uint64
 sys_open(void)
 {
   char path[MAXPATH];
+  char target[MAXPATH];
+
   int fd, omode;
+  int depth;
+  int nread;
+
   struct file *f;
   struct inode *ip;
-  int n;
+  struct inode *next;
 
   argint(1, &omode);
-  if ((n = argstr(0, path, MAXPATH)) < 0)
+  if (argstr(0, path, MAXPATH) < 0)
     return -1;
 
   begin_op();
@@ -383,41 +389,46 @@ sys_open(void)
       end_op();
       return -1;
     }
-    if (!(omode & O_NOFOLLOW)) {
-      for (int depth = 0;; depth++) {
-        char target[MAXPATH];
-        int len;
-
-        ilock(ip);
-        if (ip->type != T_SYMLINK) {
-          iunlock(ip);
-          break;
-        }
-        if (depth >= 10) {
-          iunlockput(ip);
-          end_op();
-          return -1;
-        }
-        if (ip->size >= MAXPATH ||
-            (len = readi(ip, 0, (uint64)target, 0, ip->size)) != ip->size) {
-          iunlockput(ip);
-          end_op();
-          return -1;
-        }
-        target[len] = '\0';
-        iunlockput(ip);
-        if ((ip = namei(target)) == 0) {
-          end_op();
-          return -1;
-        }
-      }
-    }
     ilock(ip);
-    if (ip->type == T_DIR && omode != O_RDONLY) {
+  }
+
+  depth = 0;
+
+  while (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+    if (depth >= MAXSYMLINKS) {
       iunlockput(ip);
       end_op();
       return -1;
     }
+
+    depth++;
+    nread = readi(ip, 0, (uint64)target, 0, sizeof(target));
+
+    if (nread <= 0 || nread > MAXPATH || target[nread - 1] != '\0') {
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+
+    iunlockput(ip);
+    next = namei(target);
+    if (next != 0) {
+      ilock(next);
+    } else if (omode & O_CREATE) {
+      next = create(target, T_FILE, 0, 0);
+    }
+
+    if (next == 0) {
+      end_op();
+      return -1;
+    }
+    ip = next;
+  }
+
+  if (ip->type == T_DIR && (omode & (O_WRONLY | O_RDWR))) {
+    iunlockput(ip);
+    end_op();
+    return -1;
   }
 
   if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)) {
