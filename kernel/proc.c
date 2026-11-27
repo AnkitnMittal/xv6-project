@@ -125,17 +125,13 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
-  // Initialize memory mapped regions
-  memset(p->vma, 0, sizeof(p->vma));
-
-  // Start mmap allocation below trapframe
-  p->cur_max = TRAPFRAME;
-
   // Initialize periodic alarm state.
   p->alarm_interval = 0;
   p->alarm_handler = 0;
   p->alarm_elapsed = 0;
   p->alarm_active = 0;
+
+  memset(p->mmap_areas, 0, sizeof(p->mmap_areas));
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -167,8 +163,6 @@ found:
 static void
 freeproc(struct proc *p)
 {
-  // Ensure no mmap regions or file references are leaked.
-  mmap_cleanup(p);
   if (p->trapframe)
     kfree((void *)p->trapframe);
   p->trapframe = 0;
@@ -254,7 +248,7 @@ growproc(int n)
 
   sz = p->sz;
   if (n > 0) {
-    if (sz + n < sz || sz + n > p->cur_max) {
+    if (sz + n > mmap_min_addr(p)) {
       return -1;
     }
     if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
@@ -288,9 +282,18 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
-  
-  // Copy mmap allocation boundary from parent.
-  np->cur_max = p->cur_max;
+
+  // Copy mmap metadata into the child.
+  for (int i = 0; i < NMMAP; i++) {
+    struct mmap_area *parent_area = &p->mmap_areas[i];
+    struct mmap_area *child_area = &np->mmap_areas[i];
+
+    if (!parent_area->valid)
+      continue;
+
+    *child_area = *parent_area;
+    child_area->file = filedup(parent_area->file);
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -298,27 +301,10 @@ kfork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
-  // Copy memory mapped regions from parent to child.
-  for (int j = 0; j < NVMA; j++) {
-    if (p->vma[j].valid) {
-      np->vma[j] = p->vma[j];
-      // Acquire a separate reference to the mapped file.
-      np->vma[j].file = filedup(p->vma[j].file);
-    }
-  }
-
-  // Copy the mapped physical pages.
-  if (mmap_forkcopy(p, np) < 0) {
-    freeproc(np);
-    release(&np->lock);
-    return -1;
-  }
-
-  // Increment reference counts on open file descriptors.
-  for (i = 0; i < NOFILE; i++) {
-    if (p->ofile[i]) np->ofile[i] = filedup(p->ofile[i]);
-  }
-
+  // increment reference counts on open file descriptors.
+  for (i = 0; i < NOFILE; i++)
+    if (p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
@@ -361,8 +347,10 @@ kexit(int status)
 {
   struct proc *p = myproc();
 
-  if (p == initproc) panic("init exiting");
-  // Clean up memory mapped regions before closing files.
+  if (p == initproc)
+    panic("init exiting");
+
+  // Flush & release mmap regions
   mmap_cleanup(p);
 
   // Close all open files.

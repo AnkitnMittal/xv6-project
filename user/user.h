@@ -27,10 +27,9 @@ int uptime(void);
 int sync(void);
 int sigalarm(int ticks, void (*handler)());
 int sigreturn(void);
-
-void *mmap(void *addr, uint64 length, int prot, int flags, int fd, uint64 offset);
-int munmap(void *addr, uint64 length);
 int symlink(const char *, const char *);
+void *mmap(void *addr, uint64 len, int prot, int flags, int fd, uint64 offset);
+int munmap(void *addr, uint64 len);
 
 // ulib.c
 int stat(const char *, struct stat *);

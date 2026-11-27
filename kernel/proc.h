@@ -1,3 +1,5 @@
+#define NMMAP 16
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -78,20 +80,20 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
-// Virtual Memory Area structure
-struct vm_area_struct {
+struct file;
+
+// structure for memory-mapped region.
+struct mmap_area {
   int valid;
 
-  uint64 start_ad;
-  uint64 end_ad;
+  uint64 addr;
   uint64 len;
-  uint64 offset; 
+  uint64 offset;
 
   int prot;
   int flags;
 
   struct file *file;
-  int fd;
 };
 
 // Per-process state
@@ -107,7 +109,7 @@ struct proc {
 
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process
- 
+
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack
   uint64 sz;                   // Size of process memory (bytes)
@@ -115,12 +117,11 @@ struct proc {
   struct trapframe *trapframe; // data page for trampoline.S
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
-  
-  struct vm_area_struct vma[NVMA];  // Memory mapped file regions
-  uint64 cur_max; // Highest available address for mmap allocation
-  
-  struct inode *cwd;           // Current directory
-  char name[16];               // Process name (debugging)
+
+  struct mmap_area mmap_areas[NMMAP]; // Memory mapped file regions
+
+  struct inode *cwd; // Current directory
+  char name[16];     // Process name (debugging)
 
   // periodic user-level alarm state
   int alarm_interval;   // Interval in timer ticks

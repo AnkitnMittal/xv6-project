@@ -130,9 +130,8 @@ kexec(char *path, char **argv)
   safestrcpy(p->name, last, sizeof(p->name));
 
   // Commit to the user image
-  // Remove old mmap regions before freeing old page table
-  mmap_cleanup(p);
   oldpagetable = p->pagetable;
+  mmap_cleanup(p);
   p->pagetable = pagetable;
   p->sz = sz;
   p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()

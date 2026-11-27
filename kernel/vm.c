@@ -10,6 +10,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "stat.h"
 
 /*
  * the kernel's page table.
@@ -139,18 +140,6 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
   pa = PTE2PA(*pte);
   return pa;
-}
-
-// Check whether a virtual address is already mapped
-int
-ismapped(pagetable_t pagetable, uint64 va)
-{
-  pte_t *pte;
-  va = PGROUNDDOWN(va);
-  if (va >= MAXVA) return 0;
-  pte = walk(pagetable, va, 0);
-  if (pte == 0) return 0;
-  return (*pte & PTE_V) != 0;
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -340,101 +329,6 @@ err:
   return -1;
 }
 
-// Copy mmap pages when a process forks.
-// MAP_SHARED:
-//   Parent and child use the same physical pages.
-// MAP_PRIVATE:
-//   Child receives independent copies of allocated pages
-int
-mmap_forkcopy(struct proc *parent, struct proc *child)
-{
-  for (int i = 0; i < NVMA; i++) {
-    struct vm_area_struct *vm = &parent->vma[i];
-
-    if (!vm->valid) continue;
-    for (uint64 va = vm->start_ad; va < vm->end_ad; va += PGSIZE) {
-      pte_t *pte = walk(parent->pagetable, va, 0);
-      // Check whether parent has already loaded this page.
-      int present = (pte != 0 && (*pte & PTE_V));
-
-      //CASE1 MAP_SHARED
-      if (vm->flags == MAP_SHARED) {
-        // Make sure every shared page has a physical page
-        // before the child starts running.
-        if (!present) {
-          char *mem = kalloc();
-          if (mem == 0) return -1;
-          memset(mem, 0, PGSIZE);
-          uint64 relative_off = va - vm->start_ad;
-          uint64 file_off = vm->offset + relative_off;
-          // Load the corresponding file data.
-          if (relative_off < vm->len) {
-            uint64 remaining = vm->len - relative_off;
-            uint read_len = remaining > PGSIZE
-                              ? PGSIZE
-                              : (uint)remaining;
-
-            struct inode *ip = vm->file->ip;
-            ilock(ip);
-            if (file_off < ip->size) {
-              uint available = ip->size - (uint)file_off;
-              if (read_len > available) read_len = available;
-              if (read_len > 0) readi(ip, 0, (uint64)mem, (uint)file_off, read_len);
-            }
-            iunlock(ip);
-          }
-
-          // Determine permissions.
-          int perm = PTE_U;
-          if (vm->prot & PROT_READ) perm |= PTE_R;
-          if (vm->prot & PROT_WRITE) perm |= PTE_R | PTE_W;
-
-          // Install this page in the parent's page table.
-          if (mappages(parent->pagetable, va, PGSIZE, (uint64)mem, perm) != 0) {
-            kfree(mem);
-            return -1;
-          }
-          pte = walk(parent->pagetable, va, 0);
-          if (pte == 0 || !(*pte & PTE_V)) return -1;
-        }
-
-        // Get the parent's physical page.
-        uint64 pa = PTE2PA(*pte);
-        uint flags = PTE_FLAGS(*pte);
-
-        // Keep physical page alive for the child.
-        kref((void *)pa);
-
-        // Map the same physical page into the child.
-        if (mappages(child->pagetable, va, PGSIZE, pa, flags) != 0) {
-          // Undo the reference increment.
-          kfree((void *)pa);
-          return -1;
-        }
-      }
-
-      //CASE2 MAP_PRIVATE
-      else if (vm->flags == MAP_PRIVATE) {
-        // An unloaded private page remains lazy.
-        if (!present) continue;
-        uint64 pa = PTE2PA(*pte);
-        uint flags = PTE_FLAGS(*pte);
-        // Allocate a separate physical page.
-        char *mem = kalloc();
-        if (mem == 0) return -1;
-        // Copy parent's page contents.
-        memmove(mem, (char *)pa, PGSIZE);
-        // Map the independent copy into child.
-        if (mappages(child->pagetable, va, PGSIZE, (uint64)mem, flags) != 0) {
-          kfree(mem);
-          return -1;
-        }
-      }
-    }
-  }
-  return 0;
-}
-
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -456,6 +350,7 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
   pte_t *pte;
+  struct proc *p = myproc();
 
   while (len > 0) {
     va0 = PGROUNDDOWN(dstva);
@@ -464,25 +359,41 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
 
     pa0 = walkaddr(pagetable, va0);
     if (pa0 == 0) {
-      if ((pa0 = vmfault(pagetable, psz, va0, 0)) == 0) {
+      int r = 0;
+      if (pagetable == p->pagetable)
+        r = mmap_pagefault(p, va0, 1);
+
+      if (r < 0)
         return -1;
+
+      if (r == 0) {
+        pa0 = vmfault(pagetable, psz, va0, 0);
+        if (pa0 == 0)
+          return -1;
+      } else {
+        pa0 = walkaddr(pagetable, va0);
+        if (pa0 == 0)
+          return -1;
       }
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
+
+    // Forbid copyout over read-only user pages.
     if ((*pte & PTE_W) == 0)
       return -1;
 
     n = PGSIZE - (dstva - va0);
     if (n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
 
@@ -493,24 +404,42 @@ int
 copyin(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
+  struct proc *p = myproc();
 
   while (len > 0) {
     va0 = PGROUNDDOWN(srcva);
+
     pa0 = walkaddr(pagetable, va0);
     if (pa0 == 0) {
-      if ((pa0 = vmfault(pagetable, psz, va0, 1)) == 0) {
+      int r = 0;
+      if (pagetable == p->pagetable)
+        r = mmap_pagefault(p, va0, 0);
+
+      if (r < 0)
         return -1;
+
+      if (r == 0) {
+        pa0 = vmfault(pagetable, psz, va0, 1);
+        if (pa0 == 0)
+          return -1;
+      } else {
+        pa0 = walkaddr(pagetable, va0);
+        if (pa0 == 0)
+          return -1;
       }
     }
+
     n = PGSIZE - (srcva - va0);
     if (n > len)
       n = len;
+
     memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
     len -= n;
     dst += n;
     srcva = va0 + PGSIZE;
   }
+
   return 0;
 }
 
@@ -524,20 +453,37 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
 {
   uint64 n, va0, pa0;
   int got_null = 0;
+  struct proc *proc = myproc();
 
   while (got_null == 0 && max > 0) {
     va0 = PGROUNDDOWN(srcva);
+
     pa0 = walkaddr(pagetable, va0);
     if (pa0 == 0) {
-      if ((pa0 = vmfault(pagetable, psz, va0, 1)) == 0) {
+      int r = 0;
+      if (pagetable == proc->pagetable)
+        r = mmap_pagefault(proc, va0, 0);
+
+      if (r < 0)
         return -1;
+
+      if (r == 0) {
+        pa0 = vmfault(pagetable, psz, va0, 1);
+        if (pa0 == 0)
+          return -1;
+      } else {
+        pa0 = walkaddr(pagetable, va0);
+        if (pa0 == 0)
+          return -1;
       }
     }
+
     n = PGSIZE - (srcva - va0);
     if (n > max)
       n = max;
 
     char *p = (char *)(pa0 + (srcva - va0));
+
     while (n > 0) {
       if (*p == '\0') {
         *dst = '\0';
@@ -546,6 +492,7 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
       } else {
         *dst = *p;
       }
+
       --n;
       --max;
       p++;
@@ -554,11 +501,8 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
 
     srcva = va0 + PGSIZE;
   }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+
+  return got_null ? 0 : -1;
 }
 
 // allocate and map user memory if process is referencing a page
@@ -569,76 +513,358 @@ uint64
 vmfault(pagetable_t pagetable, uint64 psz, uint64 va, int read)
 {
   uint64 mem;
-  struct proc *p = myproc();
+
+  if (va >= psz)
+    return 0;
   va = PGROUNDDOWN(va);
   if (ismapped(pagetable, va)) {
     return 0;
   }
-
-  // CASE 1: Normal lazy allocation (sys_sbrk)
-  if (va < psz) {
-    mem = (uint64)kalloc();
-    if (mem == 0)
-      return 0;
-    memset((void *)mem, 0, PGSIZE);
-    if (mappages(pagetable, va, PGSIZE, mem,
-                 PTE_W | PTE_U | PTE_R) != 0) {
-      kfree((void *)mem);
-      return 0;
-    }
-    return mem;
-  }
-
-  // CASE 2: Memory mapped file (mmap)
-  struct vm_area_struct *vm = 0;
-  for (int i = 0; i < NVMA; i++) {
-    if (p->vma[i].valid && p->vma[i].start_ad <= va && va < p->vma[i].end_ad) {
-      vm = &p->vma[i];
-      break;
-    }
-  }
-  if (vm == 0)
-    return 0;
-  if (read && !(vm->prot & PROT_READ))
-    return 0;
-  if (!read && !(vm->prot & PROT_WRITE))
-    return 0;
   mem = (uint64)kalloc();
   if (mem == 0)
     return 0;
   memset((void *)mem, 0, PGSIZE);
-
-  // Calculate the offset relative to the current VMA.
-uint64 relative_off = va - vm->start_ad;
-
-// Calculate the actual file offset.
-  uint64 file_off = vm->offset + relative_off;
-  if (relative_off < vm->len) {
-    uint64 remaining = vm->len - relative_off;
-    uint read_len = remaining > PGSIZE
-                      ? PGSIZE
-                      : (uint)remaining;
-    struct inode *ip = vm->file->ip;
-    ilock(ip);
-    // Do not read beyond the actual file size.
-    if (file_off < ip->size) {
-      uint available = ip->size - (uint)file_off;
-      if (read_len > available)
-        read_len = available;
-      if (read_len > 0)
-        readi(ip, 0, mem, (uint)file_off, read_len);
-    }
-    iunlock(ip);
-  }
-  
-  int perm = PTE_U;
-  if (vm->prot & PROT_READ)
-    perm |= PTE_R;
-  if (vm->prot & PROT_WRITE)
-    perm |= PTE_R | PTE_W;
-  if (mappages(pagetable, va, PGSIZE, mem, perm) != 0) {
+  if (mappages(pagetable, va, PGSIZE, mem, PTE_W | PTE_U | PTE_R) != 0) {
     kfree((void *)mem);
     return 0;
   }
   return mem;
+}
+
+int
+ismapped(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte = walk(pagetable, va, 0);
+  if (pte == 0) {
+    return 0;
+  }
+  if (*pte & PTE_V) {
+    return 1;
+  }
+  return 0;
+}
+
+static struct mmap_area *
+mmap_find_area(struct proc *p, uint64 va)
+{
+  for (int i = 0; i < NMMAP; i++) {
+    struct mmap_area *a = &p->mmap_areas[i];
+
+    if (!a->valid)
+      continue;
+
+    if (va >= a->addr && va < a->addr + a->len)
+      return a;
+  }
+
+  return 0;
+}
+
+uint64
+mmap_min_addr(struct proc *p)
+{
+  uint64 limit = TRAPFRAME;
+
+  for (int i = 0; i < NMMAP; i++) {
+    struct mmap_area *a = &p->mmap_areas[i];
+
+    if (a->valid && a->addr < limit)
+      limit = a->addr;
+  }
+
+  return limit;
+}
+
+static uint64
+mmap_find_addr(struct proc *p, uint64 len)
+{
+  uint64 size = PGROUNDUP(len);
+  uint64 top = TRAPFRAME;
+
+  for (;;) {
+    if (top < size)
+      return 0;
+
+    uint64 start = top - size;
+
+    if (start < PGROUNDUP(p->sz))
+      return 0;
+
+    int overlap = 0;
+
+    for (int i = 0; i < NMMAP; i++) {
+      struct mmap_area *a = &p->mmap_areas[i];
+
+      if (!a->valid)
+        continue;
+
+      uint64 vstart = a->addr;
+      uint64 vend = a->addr + PGROUNDUP(a->len);
+
+      if (start < vend && start + size > vstart) {
+        top = vstart;
+        overlap = 1;
+        break;
+      }
+    }
+
+    if (!overlap)
+      return start;
+  }
+}
+
+uint64
+mmap_create(struct proc *p, struct file *f, uint64 len, int prot, int flags)
+{
+  struct mmap_area *a = 0;
+
+  if (len == 0 || len > TRAPFRAME)
+    return (uint64)-1;
+
+  if (prot == 0 || (prot & ~(PROT_READ | PROT_WRITE)))
+    return (uint64)-1;
+
+  if (flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return (uint64)-1;
+
+  if (f == 0 || f->type != FD_INODE || f->ip == 0)
+    return (uint64)-1;
+
+  if (!f->readable)
+    return (uint64)-1;
+
+  if (flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable)
+    return (uint64)-1;
+
+  ilock(f->ip);
+  short type = f->ip->type;
+  iunlock(f->ip);
+
+  if (type != T_FILE)
+    return (uint64)-1;
+
+  for (int i = 0; i < NMMAP; i++) {
+    if (!p->mmap_areas[i].valid) {
+      a = &p->mmap_areas[i];
+      break;
+    }
+  }
+
+  if (a == 0)
+    return (uint64)-1;
+
+  uint64 addr = mmap_find_addr(p, len);
+
+  if (addr == 0)
+    return (uint64)-1;
+
+  memset(a, 0, sizeof(*a));
+
+  a->valid = 1;
+  a->addr = addr;
+  a->len = len;
+  a->offset = 0;
+  a->prot = prot;
+  a->flags = flags;
+  a->file = filedup(f);
+
+  return addr;
+}
+
+int
+mmap_pagefault(struct proc *p, uint64 va, int is_write)
+{
+  struct mmap_area *a = mmap_find_area(p, va);
+
+  if (a == 0)
+    return 0;
+
+  if (is_write && !(a->prot & PROT_WRITE))
+    return -1;
+
+  uint64 pageva = PGROUNDDOWN(va);
+  pte_t *pte = walk(p->pagetable, pageva, 0);
+
+  if (pte && (*pte & PTE_V))
+    return -1;
+
+  char *mem = kalloc();
+
+  if (mem == 0)
+    return -1;
+
+  memset(mem, 0, PGSIZE);
+
+  uint64 page_offset = pageva - a->addr;
+  uint64 file_offset = a->offset + page_offset;
+  uint64 remaining = a->len - page_offset;
+  uint n = remaining > PGSIZE ? PGSIZE : remaining;
+
+  ilock(a->file->ip);
+
+  if (file_offset < a->file->ip->size) {
+    uint available = a->file->ip->size - file_offset;
+
+    if (n > available)
+      n = available;
+
+    if (n > 0) {
+      int r = readi(a->file->ip, 0, (uint64)mem, (uint)file_offset, n);
+
+      if (r < 0) {
+        iunlock(a->file->ip);
+        kfree(mem);
+        return -1;
+      }
+    }
+  }
+
+  iunlock(a->file->ip);
+
+  int perm = PTE_U | PTE_R;
+
+  if (a->prot & PROT_WRITE)
+    perm |= PTE_W;
+
+  if (mappages(p->pagetable, pageva, PGSIZE, (uint64)mem, perm) != 0) {
+    kfree(mem);
+    return -1;
+  }
+
+  return 1;
+}
+
+static int
+mmap_writeback_page(struct mmap_area *a, uint64 va, uint64 pa)
+{
+  uint64 page_offset = va - a->addr;
+
+  if (page_offset >= a->len)
+    return 0;
+
+  uint n = a->len - page_offset;
+
+  if (n > PGSIZE)
+    n = PGSIZE;
+
+  uint64 file_offset = a->offset + page_offset;
+
+  begin_op();
+  ilock(a->file->ip);
+
+  if (file_offset >= a->file->ip->size) {
+    n = 0;
+  } else {
+    uint available = a->file->ip->size - file_offset;
+
+    if (n > available)
+      n = available;
+  }
+
+  int written = 0;
+
+  if (n > 0)
+    written = writei(a->file->ip, 0, pa, (uint)file_offset, n);
+
+  iunlock(a->file->ip);
+  end_op();
+
+  return written == n ? 0 : -1;
+}
+
+int
+mmap_unmap(struct proc *p, uint64 addr, uint64 len)
+{
+  if (len == 0 || addr >= TRAPFRAME)
+    return -1;
+
+  if (addr % PGSIZE != 0)
+    return -1;
+
+  if (len > TRAPFRAME - addr)
+    return -1;
+
+  uint64 end = PGROUNDUP(addr + len);
+
+  for (int i = 0; i < NMMAP; i++) {
+    struct mmap_area *a = &p->mmap_areas[i];
+
+    if (!a->valid)
+      continue;
+
+    uint64 vstart = a->addr;
+    uint64 vend = PGROUNDUP(a->addr + a->len);
+
+    if (addr < vstart || addr >= vend)
+      continue;
+
+    if (end > vend)
+      return -1;
+
+    int at_start = (addr == vstart);
+    int at_end = (end == vend);
+
+    if (!at_start && !at_end)
+      return -1;
+
+    int write_error = 0;
+
+    if (a->flags == MAP_SHARED && (a->prot & PROT_WRITE)) {
+      for (uint64 va = addr; va < end; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+
+        if (pte == 0 || !(*pte & PTE_V))
+          continue;
+
+        uint64 pa = PTE2PA(*pte);
+
+        if (mmap_writeback_page(a, va, pa) < 0)
+          write_error = 1;
+      }
+    }
+
+    for (uint64 va = addr; va < end; va += PGSIZE) {
+      pte_t *pte = walk(p->pagetable, va, 0);
+
+      if (pte && (*pte & PTE_V))
+        uvmunmap(p->pagetable, va, 1, 1);
+    }
+
+    sfence_vma();
+
+    if (at_start && at_end) {
+      struct file *f = a->file;
+
+      memset(a, 0, sizeof(*a));
+      fileclose(f);
+    } else if (at_start) {
+      uint64 removed = end - a->addr;
+
+      a->addr = end;
+      a->offset += removed;
+      a->len -= removed;
+    } else {
+      a->len = addr - a->addr;
+    }
+
+    return write_error ? -1 : 0;
+  }
+
+  return 0;
+}
+
+void
+mmap_cleanup(struct proc *p)
+{
+  for (int i = 0; i < NMMAP; i++) {
+    struct mmap_area *a = &p->mmap_areas[i];
+
+    if (!a->valid)
+      continue;
+
+    uint64 addr = a->addr;
+    uint64 len = a->len;
+
+    mmap_unmap(p, addr, len);
+  }
 }
